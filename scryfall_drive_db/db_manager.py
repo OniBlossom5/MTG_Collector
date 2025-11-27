@@ -10,7 +10,6 @@ Schema:
 - color_identity TEXT (comma-separated)
 - price_usd REAL (nullable)
 - location TEXT
-- fetched_at TEXT (isoformat)
 """
 from __future__ import annotations
 import sqlite3
@@ -40,8 +39,7 @@ class DBManager:
             name TEXT,
             color_identity TEXT,
             price_usd REAL,
-            location TEXT,
-            fetched_at TEXT
+            location TEXT
         );
         """
         with self._connect() as conn:
@@ -51,7 +49,7 @@ class DBManager:
         """
         data expected keys:
         set_code, collector_number, lang, name, color_identity (list or string), price_usd (float/None),
-        location (string), fetched_at (iso string)
+        location (string)
         Returns inserted row id.
         """
         color = data.get("color_identity")
@@ -61,8 +59,8 @@ class DBManager:
             color_str = color or ""
 
         sql = f"""
-        INSERT INTO {self.table} (set_code, collector_number, lang, name, color_identity, price_usd, location, fetched_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO {self.table} (set_code, collector_number, lang, name, color_identity, price_usd, location)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """
         params = (
             data.get("set_code"),
@@ -72,7 +70,6 @@ class DBManager:
             color_str,
             data.get("price_usd"),
             data.get("location"),
-            data.get("fetched_at") or datetime.utcnow().isoformat(),
         )
         with self._connect() as conn:
             cur = conn.execute(sql, params)
@@ -102,7 +99,7 @@ class DBManager:
             return row_id
 
     def list_all(self) -> List[Dict[str, Any]]:
-        sql = f"SELECT id, set_code, collector_number, lang, name, color_identity, price_usd, location, fetched_at FROM {self.table} ORDER BY id"
+        sql = f"SELECT id, set_code, collector_number, lang, name, color_identity, price_usd, location FROM {self.table} ORDER BY id"
         with self._connect() as conn:
             cur = conn.execute(sql)
             cols = [c[0] for c in cur.description]
