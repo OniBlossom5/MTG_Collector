@@ -101,3 +101,9 @@
 2025-11-27 01:08:55,576 INFO Inserted id=99 [1/1] UMA/11/en -> Containment Priest
 2025-11-27 01:08:55,685 INFO Inserted id=100 [1/1] SLC/13/en -> Myrel, Shield of Argive
 2025-11-27 01:08:55,685 INFO Appended 100 total entries.
+2025-11-27 01:23:27,787 INFO Starting mode=append db=database/mtg_collection.db
+2025-11-27 01:23:29,569 INFO Read newest file from Drive: Master.csv
+2025-11-27 01:23:29,569 INFO Loaded 98 rows (total quantity=100)
+2025-11-27 01:23:29,569 INFO Prefetching 98 unique Scryfall lookups with 8 workers
+2025-11-27 01:23:30,830 INFO Final batch inserted 100 entries (last_rowid=None)
+2025-11-27 01:23:30,830 INFO Appended 100 total entries (processed attempts=100)

@@ -10,3 +10,4 @@ wheels/
 .venv
 SheetsConnection.json
 database/
+*.log

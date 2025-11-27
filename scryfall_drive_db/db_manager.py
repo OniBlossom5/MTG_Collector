@@ -1,7 +1,7 @@
 """
-SQLite DB manager: creates table and provides add/remove operations.
+SQLite DB manager: creates table and provides add/remove operations with batch insert support.
 
-Schema:
+Schema (NO fetched_at):
 - id INTEGER PRIMARY KEY AUTOINCREMENT
 - set_code TEXT
 - collector_number TEXT
@@ -13,9 +13,7 @@ Schema:
 """
 from __future__ import annotations
 import sqlite3
-from typing import List, Optional, Dict, Any
-from datetime import datetime
-
+from typing import List, Optional, Dict, Any, Tuple
 
 DEFAULT_TABLE = "cards"
 
@@ -27,7 +25,11 @@ class DBManager:
         self._ensure_table()
 
     def _connect(self):
-        return sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path)
+        # Improve insert performance for batch operations
+        conn.execute("PRAGMA journal_mode = WAL;")
+        conn.execute("PRAGMA synchronous = NORMAL;")
+        return conn
 
     def _ensure_table(self):
         sql = f"""
@@ -47,10 +49,8 @@ class DBManager:
 
     def add_entry(self, data: Dict[str, Any]) -> int:
         """
-        data expected keys:
-        set_code, collector_number, lang, name, color_identity (list or string), price_usd (float/None),
-        location (string)
-        Returns inserted row id.
+        Insert a single entry. Returns inserted row id.
+        Expects keys: set_code, collector_number, lang, name, color_identity, price_usd, location
         """
         color = data.get("color_identity")
         if isinstance(color, (list, tuple)):
@@ -75,6 +75,43 @@ class DBManager:
             cur = conn.execute(sql, params)
             return cur.lastrowid # type: ignore
 
+    def add_entries(self, entries: List[Dict[str, Any]]) -> Tuple[int, Optional[int]]:
+        """
+        Batch insert many entries inside a single transaction.
+        Returns (number_inserted, last_rowid or None).
+        """
+        if not entries:
+            return 0, None
+
+        sql = f"""
+        INSERT INTO {self.table} (set_code, collector_number, lang, name, color_identity, price_usd, location)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """
+
+        params_list = []
+        for data in entries:
+            color = data.get("color_identity")
+            if isinstance(color, (list, tuple)):
+                color_str = ",".join(color)
+            else:
+                color_str = color or ""
+            params = (
+                data.get("set_code"),
+                str(data.get("collector_number")) if data.get("collector_number") is not None else None,
+                data.get("lang"),
+                data.get("name"),
+                color_str,
+                data.get("price_usd"),
+                data.get("location"),
+            )
+            params_list.append(params)
+
+        with self._connect() as conn:
+            cur = conn.executemany(sql, params_list)
+            n = len(params_list)
+            last = cur.lastrowid if hasattr(cur, "lastrowid") else None
+            return n, last
+
     def remove_first_matching(self, set_code: str, collector_number: str, lang: Optional[str]) -> Optional[int]:
         """
         Find the first (lowest id) row that matches set_code, collector_number, and lang (lang may be None)
@@ -82,7 +119,7 @@ class DBManager:
         """
         where_clause = "set_code = ? AND collector_number = ?"
         params = [set_code, str(collector_number)]
-        if lang is None:
+        if lang is None or lang == "":
             where_clause += " AND (lang IS NULL OR lang = '')"
         else:
             where_clause += " AND lang = ?"

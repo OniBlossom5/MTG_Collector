@@ -1,27 +1,20 @@
 #!/usr/bin/env python3
 """
-Command-line entrypoint.
+Main CLI with parallel Scryfall prefetch, batch inserts, and tqdm progress bar.
 
-Modes: append, remove
+New CLI flags:
+  --chunk-size INT        Batch insert size (default 500)
+  --prefetch-workers INT  Number of parallel workers for Scryfall prefetch (default 8)
+  --no-prefetch           Disable prefetch: fall back to the previous (per-row/cached) behavior
 
-Examples:
-  python cli.py append --folder-id FOLDER_ID --credentials sa.json --db cards.db --location personal
-  python cli.py remove --local-csv /tmp/to_remove.csv --db cards.db
-
-CSV column mapping defaults (case-insensitive):
-  set_code -> set_code
-  collector_number -> collector_number
-  language -> language
-  foil -> foil   (values: normal | foil | etched)
-  quantity -> quantity (integer, default 1)
-
-Logging:
-  - Detailed per-row actions (inserted ids, removed ids, fetch failures, etc.) are written to a log file
-    specified with --log-file (default: mtg_collector.log).
-  - Console output is kept concise: errors/warnings are shown; a final summary is printed.
-  - Pass --verbose to also show per-row INFO messages on the console.
-
-If local CSV is provided, Drive is not used.
+Existing defaults preserved:
+  folder-id default: '1cc7nHtHuHpkrhTLjKxzStRE8wN2a-1Ia'
+  location default: 'bulk'
+  set-col default: 'Set code'
+  num-col default: 'Collector number'
+  lang-col default: 'Language'
+  foil-col default: 'Foil'
+  qty-col default: 'Quantity'
 """
 from __future__ import annotations
 import argparse
@@ -29,12 +22,16 @@ import csv
 import io
 import sys
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime
+from collections import namedtuple
 
 from scryfall_drive_db.drive_client import DriveClient
 from scryfall_drive_db.scryfall_client import ScryfallClient
 from scryfall_drive_db.db_manager import DBManager
+from scryfall_drive_db.prefetch import prefetch_cards
+
+from tqdm import tqdm
 
 
 def setup_logging(log_file: str, verbose: bool) -> logging.Logger:
@@ -58,9 +55,6 @@ def setup_logging(log_file: str, verbose: bool) -> logging.Logger:
 
 
 def detect_column(row: Dict[str, str], candidates: list) -> Optional[str]:
-    """
-    Given a CSV row keys and candidate names, return the first matching actual key (case-insensitive)
-    """
     lower_to_actual = {k.lower(): k for k in row.keys()}
     for cand in candidates:
         if cand.lower() in lower_to_actual:
@@ -69,9 +63,6 @@ def detect_column(row: Dict[str, str], candidates: list) -> Optional[str]:
 
 
 def parse_quantity(value: Optional[str]) -> int:
-    """
-    Safely parse quantity. Default 1 on missing/unparseable; floor for floats; negative or zero -> 0.
-    """
     if value is None:
         return 1
     v = str(value).strip()
@@ -84,37 +75,48 @@ def parse_quantity(value: Optional[str]) -> int:
     return max(q, 0)
 
 
-def iterate_csv_bytes(content: bytes, set_col: str, num_col: str, lang_col: Optional[str],
-                      foil_col: Optional[str], qty_col: Optional[str]):
-    s = content.decode("utf-8-sig")  # handle BOM
+CsvRow = namedtuple("CsvRow", ["row", "set_col", "num_col", "lang_col", "foil_col", "qty_col"])
+
+
+def load_csv_rows(content: bytes, set_col: str, num_col: str, lang_col: Optional[str],
+                  foil_col: Optional[str], qty_col: Optional[str]) -> Tuple[List[CsvRow], int]:
+    s = content.decode("utf-8-sig")
     reader = csv.DictReader(io.StringIO(s))
-    # detect actual column names from header if given names aren't present
+    rows: List[CsvRow] = []
     first = None
+    total_qty = 0
+    detected_set, detected_num, detected_lang, detected_foil, detected_qty = set_col, num_col, lang_col, foil_col, qty_col
+
     for row in reader:
         if first is None:
             first = row
-            # map columns if the provided ones aren't exactly present
-            if set_col not in row:
+            if detected_set not in row:
                 found = detect_column(row, [set_col, "set_code", "set", "setcode"])
                 if found:
-                    set_col = found
-            if num_col not in row:
+                    detected_set = found
+            if detected_num not in row:
                 found = detect_column(row, [num_col, "collector_number", "collector#","number"])
                 if found:
-                    num_col = found
-            if lang_col and lang_col not in row:
-                found = detect_column(row, [lang_col, "language", "lang"])
+                    detected_num = found
+            if detected_lang and detected_lang not in row:
+                found = detect_column(row, [detected_lang, "language", "lang"])
                 if found:
-                    lang_col = found
-            if foil_col and foil_col not in row:
-                found = detect_column(row, [foil_col, "foil", "is_foil", "etched"])
+                    detected_lang = found
+            if detected_foil and detected_foil not in row:
+                found = detect_column(row, [detected_foil, "foil", "is_foil", "etched"])
                 if found:
-                    foil_col = found
-            if qty_col and qty_col not in row:
-                found = detect_column(row, [qty_col, "quantity", "qty", "count"])
+                    detected_foil = found
+            if detected_qty and detected_qty not in row:
+                found = detect_column(row, [detected_qty, "quantity", "qty", "count"])
                 if found:
-                    qty_col = found
-        yield row, set_col, num_col, lang_col, foil_col, qty_col
+                    detected_qty = found
+
+        qty_val = row.get(detected_qty) if detected_qty else None
+        qty = parse_quantity(qty_val)
+        total_qty += max(qty, 0)
+        rows.append(CsvRow(row=row, set_col=detected_set, num_col=detected_num,
+                           lang_col=detected_lang, foil_col=detected_foil, qty_col=detected_qty))
+    return rows, total_qty
 
 
 def pick_price_from_json(json: Dict[str, Any], foil_value: Optional[str]) -> Optional[float]:
@@ -135,95 +137,168 @@ def pick_price_from_json(json: Dict[str, Any], foil_value: Optional[str]) -> Opt
 
 def process_append(content_bytes: bytes, db: DBManager, scry: ScryfallClient,
                    set_col: str, num_col: str, lang_col: Optional[str], foil_col: Optional[str],
-                   qty_col: Optional[str], default_location: str, logger: logging.Logger):
-    total_inserted = 0
-    for row, set_col, num_col, lang_col, foil_col, qty_col in iterate_csv_bytes(
-            content_bytes, set_col, num_col, lang_col, foil_col, qty_col):
-        set_code = (row.get(set_col) if set_col else None)
-        collector_number = (row.get(num_col) if num_col else None)
-        lang = (row.get(lang_col) if lang_col else None)
-        foil_value = (row.get(foil_col) if foil_col else None)
-        qty_val = row.get(qty_col) if qty_col else None
-        quantity = parse_quantity(qty_val)
+                   qty_col: Optional[str], default_location: str, logger: logging.Logger,
+                   chunk_size: int = 500, prefetch_workers: int = 8, do_prefetch: bool = True):
+    rows, total_qty = load_csv_rows(content_bytes, set_col, num_col, lang_col, foil_col, qty_col)
+    logger.info("Loaded %d rows (total quantity=%d)", len(rows), total_qty)
+    if total_qty == 0:
+        print("No items to append (total quantity is 0).")
+        return
 
-        if not set_code or not collector_number:
-            logger.warning("Skipping row missing set_code or collector_number: %s", row)
+    # Build unique keys from rows
+    unique_keys = []
+    seen = set()
+    for cr in rows:
+        row = cr.row
+        sc = row.get(cr.set_col)
+        cn = row.get(cr.num_col)
+        lang = (row.get(cr.lang_col) if cr.lang_col else "") or ""
+        if not sc or not cn:
             continue
-        if quantity <= 0:
-            logger.warning("Skipping %s/%s because quantity=%s", set_code, collector_number, quantity)
-            continue
+        key = (str(sc).strip(), str(cn).strip(), str(lang).strip())
+        if key not in seen:
+            seen.add(key)
+            unique_keys.append(key)
 
-        try:
-            js = scry.get_card(set_code.strip(), collector_number.strip(), lang.strip() if lang else None)
-        except Exception as e:
-            logger.warning("Failed to fetch %s/%s/%s: %s", set_code, collector_number, lang or "", e)
-            continue
+    cache: Dict[Tuple[str, str, str], Optional[Dict[str, Any]]] = {}
 
-        name = js.get("name")
-        color_identity = js.get("color_identity", [])
-        price_usd = pick_price_from_json(js, foil_value)
+    if do_prefetch:
+        logger.info("Prefetching %d unique Scryfall lookups with %d workers", len(unique_keys), prefetch_workers)
+        cache = prefetch_cards(scry, unique_keys, max_workers=prefetch_workers, logger=logger)
+    else:
+        logger.info("Prefetch disabled; will fetch on-demand with caching")
 
-        # Insert quantity times, but only fetch Scryfall once
-        for i in range(quantity):
-            entry = {
-                "set_code": set_code.strip(),
-                "collector_number": collector_number.strip(),
-                "lang": (lang or "").strip(),
-                "name": name,
-                "color_identity": color_identity,
-                "price_usd": price_usd,
-                "location": default_location
-            }
-            try:
-                row_id = db.add_entry(entry)
-                total_inserted += 1
-                # Log the detailed per-insert line to the file (INFO). It will only appear on console if --verbose.
-                logger.info("Inserted id=%s [%d/%d] %s/%s/%s -> %s", row_id, i+1, quantity,
-                            set_code, collector_number, lang or "", name)
-            except Exception as e:
-                logger.error("Failed to insert entry for %s/%s: %s", set_code, collector_number, e)
-    # concise summary to console (and logged)
-    logger.info("Appended %d total entries.", total_inserted)
-    print(f"Appended {total_inserted} total entries.")
+    batch: List[Dict[str, Any]] = []
+    processed = 0
+
+    pbar = tqdm(total=total_qty, unit="card", desc="Appending", dynamic_ncols=True)
+    try:
+        for cr in rows:
+            row = cr.row
+            set_code = (row.get(cr.set_col) if cr.set_col else None)
+            collector_number = (row.get(cr.num_col) if cr.num_col else None)
+            lang = (row.get(cr.lang_col) if cr.lang_col else None) or ""
+            foil_value = (row.get(cr.foil_col) if cr.foil_col else None)
+            qty_val = row.get(cr.qty_col) if cr.qty_col else None
+            quantity = parse_quantity(qty_val)
+
+            if not set_code or not collector_number:
+                logger.warning("Skipping row missing set_code or collector_number: %s", row)
+                pbar.update(max(quantity, 0))
+                continue
+            if quantity <= 0:
+                logger.warning("Skipping %s/%s because quantity=%s", set_code, collector_number, quantity)
+                continue
+
+            key = (set_code.strip(), collector_number.strip(), (lang or "").strip())
+            js = None
+
+            if do_prefetch:
+                js = cache.get(key)
+                if js is None:
+                    logger.warning("No prefetch result or prefetch failed for %s/%s/%s; skipping", key[0], key[1], key[2] or "")
+                    pbar.update(quantity)
+                    processed += quantity
+                    continue
+            else:
+                # on-demand fetch with caching
+                if key in cache:
+                    js = cache[key]
+                else:
+                    try:
+                        js = scry.get_card(key[0], key[1], key[2] or None)
+                        cache[key] = js
+                    except Exception as e:
+                        logger.warning("Failed to fetch %s/%s/%s: %s", key[0], key[1], key[2] or "", e)
+                        pbar.update(quantity)
+                        processed += quantity
+                        continue
+
+            name = js.get("name") # type: ignore
+            color_identity = js.get("color_identity", []) # type: ignore
+            price_usd = pick_price_from_json(js, foil_value) # type: ignore
+
+            for _ in range(quantity):
+                entry = {
+                    "set_code": key[0],
+                    "collector_number": key[1],
+                    "lang": key[2],
+                    "name": name,
+                    "color_identity": color_identity,
+                    "price_usd": price_usd,
+                    "location": default_location
+                }
+                batch.append(entry)
+
+                if len(batch) >= chunk_size:
+                    n_inserted, last_rowid = db.add_entries(batch)
+                    logger.info("Batch inserted %d entries (last_rowid=%s)", n_inserted, last_rowid)
+                    batch.clear()
+
+                pbar.update(1)
+                processed += 1
+
+        # final flush
+        if batch:
+            n_inserted, last_rowid = db.add_entries(batch)
+            logger.info("Final batch inserted %d entries (last_rowid=%s)", n_inserted, last_rowid)
+            batch.clear()
+    finally:
+        pbar.close()
+
+    logger.info("Appended %d total entries (processed attempts=%d)", processed, total_qty)
+    print(f"Appended {processed} total entries.")
 
 
 def process_remove(content_bytes: bytes, db: DBManager, set_col: str, num_col: str, lang_col: Optional[str],
                    foil_col: Optional[str], qty_col: Optional[str], logger: logging.Logger):
-    total_removed = 0
-    for row, set_col, num_col, lang_col, foil_col, qty_col in iterate_csv_bytes(
-            content_bytes, set_col, num_col, lang_col, foil_col, qty_col):
-        set_code = (row.get(set_col) if set_col else None)
-        collector_number = (row.get(num_col) if num_col else None)
-        lang = (row.get(lang_col) if lang_col else None)
-        qty_val = row.get(qty_col) if qty_col else None
-        quantity = parse_quantity(qty_val)
+    rows, total_qty = load_csv_rows(content_bytes, set_col, num_col, lang_col, foil_col, qty_col)
+    logger.info("Loaded %d rows for removal (total quantity=%d)", len(rows), total_qty)
+    if total_qty == 0:
+        print("No items to remove (total quantity is 0).")
+        return
 
-        if not set_code or not collector_number:
-            logger.warning("Skipping row missing set_code or collector_number: %s", row)
-            continue
-        if quantity <= 0:
-            logger.warning("Skipping removal for %s/%s because quantity=%s", set_code, collector_number, quantity)
-            continue
+    removed_total = 0
+    pbar = tqdm(total=total_qty, unit="card", desc="Removing", dynamic_ncols=True)
+    try:
+        for cr in rows:
+            row = cr.row
+            set_code = (row.get(cr.set_col) if cr.set_col else None)
+            collector_number = (row.get(cr.num_col) if cr.num_col else None)
+            lang = (row.get(cr.lang_col) if cr.lang_col else None)
+            qty_val = row.get(cr.qty_col) if cr.qty_col else None
+            quantity = parse_quantity(qty_val)
 
-        removed_for_row = 0
-        for i in range(quantity):
-            removed_id = db.remove_first_matching(set_code.strip(), collector_number.strip(),
-                                                  (lang or "").strip() if lang else None)
-            if removed_id:
-                removed_for_row += 1
-                total_removed += 1
-                logger.info("Removed id=%s for %s/%s/%s [%d/%d]", removed_id, set_code, collector_number, lang or "",
-                            removed_for_row, quantity)
-            else:
-                # no more matches for this row
-                if removed_for_row == 0:
-                    logger.info("No match found for %s/%s/%s", set_code, collector_number, lang or "")
+            if not set_code or not collector_number:
+                logger.warning("Skipping row missing set_code or collector_number: %s", row)
+                pbar.update(quantity)
+                continue
+            if quantity <= 0:
+                logger.warning("Skipping removal for %s/%s because quantity=%s", set_code, collector_number, quantity)
+                pbar.update(0)
+                continue
+
+            removed_for_row = 0
+            for _ in range(quantity):
+                removed_id = db.remove_first_matching(set_code.strip(), collector_number.strip(),
+                                                      (lang or "").strip() if lang else None)
+                pbar.update(1)
+                if removed_id:
+                    removed_for_row += 1
+                    removed_total += 1
+                    logger.info("Removed id=%s for %s/%s/%s", removed_id, set_code, collector_number, lang or "")
                 else:
-                    logger.info("Stopped after removing %d/%d entries for %s/%s/%s (no more matches).",
-                                removed_for_row, quantity, set_code, collector_number, lang or "")
-                break
-    logger.info("Removed %d total entries.", total_removed)
-    print(f"Removed {total_removed} total entries.")
+                    if removed_for_row == 0:
+                        logger.info("No match found for %s/%s/%s", set_code, collector_number, lang or "")
+                    else:
+                        logger.info("Stopped after removing %d entries for %s/%s/%s (no more matches).",
+                                    removed_for_row, set_code, collector_number, lang or "")
+                    break
+    finally:
+        pbar.close()
+
+    logger.info("Removed %d total entries.", removed_total)
+    print(f"Removed {removed_total} total entries.")
 
 
 def main():
@@ -241,6 +316,9 @@ def main():
     p.add_argument("--qty-col", default="Quantity", help="CSV column indicating quantity (integer, default 1)")
     p.add_argument("--log-file", default="mtg_collector.log", help="Path to log file for detailed per-row logs")
     p.add_argument("--verbose", action="store_true", help="Also print INFO messages to console (per-row actions)")
+    p.add_argument("--chunk-size", type=int, default=500, help="Batch insert chunk size (default 500)")
+    p.add_argument("--prefetch-workers", type=int, default=8, help="Number of parallel workers for Scryfall prefetch")
+    p.add_argument("--no-prefetch", action="store_true", help="Disable parallel prefetch; fetch on-demand (cached)")
     args = p.parse_args()
 
     if not args.local_csv and not args.folder_id:
@@ -274,12 +352,13 @@ def main():
             print("No CSV found in folder", file=sys.stderr)
             sys.exit(1)
         content_bytes = content
-        # brief console feedback
         print(f"Read newest file from Drive: {name}")
         logger.info("Read newest file from Drive: %s", name)
 
+    do_prefetch = not args.no_prefetch
+
     if args.mode == "append":
-        process_append(content_bytes, db, scry, args.set_col, args.num_col, args.lang_col, args.foil_col, args.qty_col, args.location, logger)
+        process_append(content_bytes, db, scry, args.set_col, args.num_col, args.lang_col, args.foil_col, args.qty_col, args.location, logger, chunk_size=args.chunk_size, prefetch_workers=args.prefetch_workers, do_prefetch=do_prefetch)
     else:
         process_remove(content_bytes, db, args.set_col, args.num_col, args.lang_col, args.foil_col, args.qty_col, logger)
 
